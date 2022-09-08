@@ -1,0 +1,2373 @@
+Appendix C
+
+Concept Drift R Source Code
+
+
+# ************************************************
+# FRAUD PATTERN DRIFT ANALYSIS
+# Clears all objects in "global environment"
+rm(list=ls())
+
+# ************************************************
+# Global variables
+# ************************************************
+
+# Input dataset
+# Downloaded from https://www.cs.purdue.edu/commugrate/data/credit_card/
+#
+DATASET_INPUT       <- "DataminingContest2009.Task2.Train.Inputs.csv"      # input fields dataset file
+DATASET_TARGET      <- "DataminingContest2009.Task2.Train.Targets.csv"     # target fields dataset file
+
+# Output datasets, created for further analysis in Excel, etc.
+DATASET_COMBINED    <- "FICOcombined.csv"                                  # dataset with inputs, fraud and day
+DATASET_PREPROCESSED <-"FICOpreprocessed.csv"                              # preprocessed and scaled dataset
+
+OUTPUT_FIELD      <- "fraud"
+
+# Name of fields to remove from dataset
+# zip1 is the same as state1
+# custAttr1 is the account/card number
+# custAttr2 is e-mail id of the customer.
+# hour2 is the same as hour1
+# total is the same as amount
+
+REMOVE_FIELDS     <- c("zip1",
+                       "custAttr1",	
+                       "custAttr2",
+                       "hour2",
+                       "total"
+                      )
+
+SCALE_DATASET     <- TRUE                 # Set to true to scale dataset before ML stage
+OUTLIER_CONF      <- -0.95                # Confidence p-value for outlier detection
+                                          # Set to negative means analyse but do not replace outliers
+
+TYPE_DISCREET     <- "DISCREET"           # field is discreet (numeric)
+TYPE_ORDINAL      <- "ORDINAL"            # field is continuous numeric
+TYPE_SYMBOLIC     <- "SYMBOLIC"           # field is a string
+TYPE_NUMERIC      <- "NUMERIC"            # field is initially a numeric
+TYPE_IGNORE       <- "IGNORE"             # field is not encoded
+
+DISCREET_BINS     <- 8                    # Number of empty bins to determine discreet
+MAX_LITERALS      <-55                    # Maximum numner of hotcoding new fields
+
+# ************************************************
+# main() : main entry point
+# INPUT:   None
+# OUTPUT : None
+# ************************************************
+main<-function(){
+
+  # ************************************************
+  # prepareDataset() :
+  # Read the original FICO files
+  # Combine into input fields and the target
+  # Remove duplicated fields and those with too many literals
+  # Add a new field called day
+  #
+  # INPUT:  None
+  # OUTPUT :preprocessed dataset as a frame
+  # ************************************************
+  prepareDataset<-function(){
+    # Dataset file needs the input fields, target (fraud flag) and day of the transaction
+    # If this file has not already been created, then create it
+    if (!file.exists(DATASET_COMBINED)){
+      print(paste("Creating combined dataset from",DATASET_INPUT,DATASET_TARGET))
+
+    # Read the input fields
+    dataset<-read.csv(file=DATASET_INPUT,encoding="UTF-8",header=TRUE, stringsAsFactors = FALSE)
+    print(paste("CSV dataset",DATASET_INPUT,"has been read. Records=",nrow(dataset),"Fields=",ncol(dataset)))
+
+    # Read the fraud classification and name the field as OUTPUT_FIELD
+    targets<-read.csv(file=DATASET_TARGET,encoding="UTF-8",col.names=OUTPUT_FIELD,header=FALSE,stringsAsFactors = FALSE)
+    print(paste("CSV dataset",DATASET_TARGET,"has been read. Records=",nrow(targets),"Fields=",ncol(targets)))
+
+    # Create a single dataset with input field and the target field
+    dataset<-cbind(dataset,targets)
+
+    # ************************************************
+    # REMOVEFIELDS (as determined to be duplicated)
+
+    print("Removing fields")
+    print(paste(REMOVE_FIELDS,collapse = ","))
+    dataset<-dataset[ , !(names(dataset) %in% REMOVE_FIELDS)]
+
+    # ************************************************
+    # Add the day of the transaction starting at day 1
+    # Everytime the hour changes back to 0 (midnight), we assume it is a new day
+
+    print("Creating a day field")
+    dataset$day<-0
+    records<-nrow(dataset)
+    midnightIndex<-which(dataset$hour1==0)
+    startDay<-  midnightIndex[1:(records-1)]==midnightIndex[2:records]-1
+    indexDay<-which(startDay==FALSE)
+    startNewDayRecord<-midnightIndex[indexDay+1]
+
+    # This creates in an increasing day number each time midnight is passed
+    start<-1
+    for (day in 1:length(startNewDayRecord)){
+        end<-startNewDayRecord[day]
+        dataset$day[start:end]<-day
+        start<-end
+      }
+    # Any remaining records
+    day<-day+1
+    dataset$day[start:records]<-day
+
+    print(paste("Number of days in dataset=",day))
+
+    # ************************************************
+    # Encode the hour (which is 0-23) into 2 features (as lab 5)
+    print("Encoding the hour1 field into two new feature fields")
+    dataset$hour_fc<-cos((2*pi*dataset$hour1)/24)
+    dataset$hour_fs<-sin((2*pi*dataset$hour1)/24)
+
+    # ************************************************
+    # Encode the state
+    # See https://stat.ethz.ch/R-manual/R-patched/library/datasets/html/state.html
+    # Uses the library "datasets"
+    # This looks up the two letter abberviation in the "state" dataset
+    # and then extracts x as the longitude and y is the latitude
+
+    print("Encoding the state1 field into longitude & latitude fields")
+
+    dataset$longitude<-NA
+    dataset$latitude<-NA
+
+    states<-data.frame(state1=state.abb,
+                       longitude=state.center$x,
+                       latitude=state.center$y,
+                       stringsAsFactors = FALSE)
+
+    # The FICO dataset uses some abbreviations not in the above table
+    # DC for District of Columbia
+    # AP - Armed Forces Pacific - Used Kyoto, Japan as coordinates
+    # AE - Armed Forces Europe - Used Berlin, Germany as coordinates
+    # PR - Puerto Rico, used San Juan, Puerto Rico
+
+    otherStates<-list(
+      data.frame(state1="DC",longitude=-77.009003,latitude=38.889931),
+      data.frame(state1="AP",longitude=-135.75385,latitude=35.02107),
+      data.frame(state1="AE",longitude=-52.520008,latitude=313.404954),
+      data.frame(state1="PR", longitude=-66.105721,latitude=18.466333)
+    )
+    # Convert the above list to a dataframe and then join into a single dataframe
+    states<-rbind(states,do.call(rbind.data.frame,otherStates))
+
+    # Look up the abbreviation and convert to lat/long
+    dataset$longitude<-as.numeric(sapply(dataset$state1,function(x) states$longitude[which(states$state1==x)]))
+    dataset$latitude<-as.numeric(sapply(dataset$state1,function(x) states$latitude[which(states$state1==x)]))
+
+    # Check if any states were not covnerted, simply remove the records
+    anyMissing<-which(is.na(dataset$latitude))
+    numbrStatesMissing<-length(anyMissing)
+    if (numbrStatesMissing>0){
+      print(paste("REMOVING", numbrStatesMissing, "records, where states were not recognised"))
+      dataset<-na.omit(dataset)
+    }
+
+    # ************************************************
+    # Output the dataset
+    write.csv(dataset,file=DATASET_COMBINED, row.names=FALSE)
+    print(paste("Write CSV dataset",DATASET_COMBINED,"Records=",nrow(dataset),"Fields=",ncol(dataset)))
+
+    } else {
+      # ************************************************
+      # Read the dataset that we have already created
+      dataset<-read.csv(file=DATASET_COMBINED,encoding="UTF-8",header=TRUE, stringsAsFactors = FALSE)
+      print(paste("CSV combined dataset",DATASET_COMBINED,"has been read. Records=",nrow(dataset)))
+    }
+    return(dataset)
+  } #endof prepareDataset()
+
+  # ************************************************
+  # preprocessDataset() :
+  # Read the original FICO files
+  # Combine into input fields and the target
+  # Remove duplicated fields and those with too many literals
+  # Add a new field called day
+  # Pre-process and then scale values [0,1]
+  #
+  # INPUT:  None
+  # OUTPUT :preprocessed dataset as a frame
+  # ************************************************
+  preprocessDataset<-function(dataset){
+
+    # Remove the original hour field, as now encoded
+    dataset$hour1<-NULL
+
+    # ************************************************
+    # Set fields to the type we want
+
+    NPREPROCESSING_setInitialFieldType("amount",    TYPE_ORDINAL)
+    NPREPROCESSING_setInitialFieldType("longitude", TYPE_ORDINAL)
+    NPREPROCESSING_setInitialFieldType("latitude",  TYPE_ORDINAL)
+    NPREPROCESSING_setInitialFieldType("day",       TYPE_IGNORE)
+    NPREPROCESSING_setInitialFieldType("state1",    TYPE_IGNORE)
+
+    # ************************************************
+    # Preprocess the dataset ready for machine learning
+    # Pre-process the dataset to scaled numeric [0,1]
+
+    print("Preprocess the dataset ready for machine learning")
+    newDataset<-NPREPROCESSING_dataset(dataset=dataset,
+                                       scaleFlag=SCALE_DATASET,
+                                       confidence=OUTLIER_CONF)
+    print("Field names are:")
+    print(paste(names(newDataset),collapse = ","))
+
+    # ************************************************
+    # Output the preprocessed dataset
+    write.csv(newDataset,file=DATASET_PREPROCESSED, row.names=FALSE)
+    print(paste("Write CSV dataset",DATASET_PREPROCESSED,"Records=",nrow(newDataset),"Fields=",ncol(newDataset)))
+
+    return(newDataset)
+
+  } #endof preprocessDataset()
+
+  # ************************************************
+  # Prepare the FICO dataset
+  # [need to consider how we could inlcude the domain1 field in future?]
+
+  prepareDataset<-prepareDataset()
+
+  # ************************************************
+  # Output summary statistics to Viewer
+  print("Calculating summary statistics")
+  NPREPROCESSING_prettyDataset(prepareDataset)
+
+  # ************************************************
+  # Visualise the dataset
+  days<-max(prepareDataset$day)  #Number of days in the dataset
+  print(paste("Number of days in the dataset",days))
+  hist(prepareDataset$day,breaks=nrow(prepareDataset),ylab = "Transactions in a day",xlab="day")
+  table(prepareDataset$day)
+
+  # ************************************************
+  # preprocess the FICO dataset
+
+  pDataset<-preprocessDataset(prepareDataset)
+
+  # This is now ready for machine learning models
+  # Remember to EXCLUDE the "day" field - we do not want to learn on this
+  # Use pDataset to train/evaluate the ML models
+
+} #endof main()
+
+
+# ************************************************
+# This is where R starts execution
+# clears the console area
+
+cat("\014")
+
+print("START")
+
+#Define and then load the libraries used in this project
+myLibraries<-c(
+  "formattable",
+  "outliers",
+  "PerformanceAnalytics",
+  "corrplot",
+  "factoextra",
+  "datasets"
+  )
+
+library(pacman)
+pacman::p_load(char=myLibraries,install=TRUE,character.only=TRUE)
+
+#Load additional R script files provide for this lab
+source("6dataPrepFunctions.R")
+
+set.seed(123)
+
+main()
+
+print("END")
+
+
+
+# UPDATE
+# 1.00      1/2/2017    Initial Version
+# 1.01      14/2/2018   NPREPROCESSING_discreetNumeric - changed for total of ten bins
+#                       Added bin number as x-axis label
+# 1.02      26/2/2018   Added NcalcMeasures(), updated NcalcConfusion() to use this.
+#                       Updated NPREPROCESSING_splitdataset() with descripition
+#                       Updated Npreprocessdataset() with scaleFlag
+# 1.03      2/3/2018    Renamed Npreprocessdataset() to NPREPROCESSING_dataset()
+#                       Added library(neuralnet) inside NLEARN_BasicNeural()
+# 1.04      5/3/2018    Added global constants - although these values should be PASSED
+#                       NPREPROCESSING_dataset() added vector manualTypes
+#                       Updated all functions to include manualTypes where required
+#                       Added NPREPROCESSING_setInitialFieldType()
+#                       Added MAX_LITERALS as a constant
+#                       Added NPREPROCESSING_removeAllSameValueField()
+#                       NPREPROCESSING_categorical() does not convert very sparse fields
+#                       Removed N_LEARN_BasicNeural() and put in lab functions source
+# 1.05      7/3/2018    NPREPROCESSING_discreetNumeric() updated to show plot for all numeric fields
+#                       & title on plot shows if field type manually set or determined by preprocessing
+# 1.06      18/2/2019   For lab 3
+# 1.07      19/2/2019   Fixed NPREPROCESSING_discreetNumeric() with scale
+# 1.08      24/2/2019   Updated NcalcConfusion()
+#                       Added NROCgraph(),NPREPROCESSING_prettyDataset()
+#           9/3/2019    Updated manual setting of field types
+#           6/8/2019    NPREPROCESSING_categorical() added "_" to make field name easier to read
+#                       NPREPROCESSING_dataset() fixed scaling to do each column seperatley
+#                       pass confidence as parameter for outlier detection
+#           7/8/2019    NPREPROCESSING_outlier() - if negative confidence then do not replace outlier
+#                       NROCgraph() - updated as the pROC library had changed
+#                       NcalcConfusion() - convert values to doubles to avoid integers overflowing
+#                       NprintMeasures() - output to viewer only
+#           8/8/2019    NplotConfusion() - added new function for pretty confusion chart
+# #         21/8/2019   Removed border from the plot
+# ************************************************
+
+# Common functions to use in lab 6 and beyond
+
+# To manually set a field type
+# This will store $name=field name, $type=field type
+manualTypes <- data.frame()
+
+# ************************************************
+# preprocessdataset() :
+# Run the steps discussed to pre-process a dataset
+#
+# INPUT:   frame - dataset   - to preprocess
+#          bool - scaleFlag  - true to scale dataset
+#          real - confidence - [0,1] for outlier detection
+#
+# OUTPUT : Frame - pre-processed dataset
+# ************************************************
+NPREPROCESSING_dataset<-function(dataset, scaleFlag, confidence){
+
+  # ************************************************
+  # Determine initial field types: NUMERIC or SYMBOLIC
+  field_types<-NPREPROCESSING_initialFieldType(dataset)
+
+  # ************************************************
+  #Determine if the numeric fields might be discreet numeric
+  #If there are over n bins with less than 1% of the values, then the field is
+  #marked as a discreet numeric
+  field_types<-NPREPROCESSING_discreetNumeric(dataset,field_types,DISCREET_BINS)
+
+  # ************************************************
+  # IF ORDINAL TYPES:
+  # This is a sub-set frame of just the ordinal fields
+  ordinals<-dataset[,which(field_types==TYPE_ORDINAL)]
+
+  # ************************************************
+  # Test if any ordinals are outliers and replace with mean values
+  # Null hyposis is there are no outliers
+  # We reject this if the p-value<significance (i.e. 0.05), confidence=95%
+  # 070819NRT - confidence is passed as a parameter
+
+  ordinals<-NPREPROCESSING_outlier(ordinals,confidence)
+
+  if (scaleFlag==TRUE){
+    # ************************************************
+    # z-scale
+    # 090819NRT return as a dataframe
+
+    zscaled<-as.data.frame(apply(ordinals, MARGIN = 2, FUN = function(X) (scale(X,center=TRUE, scale=TRUE))))
+
+    # ************************************************
+    # Scale in this case to be [0.0,1.0]
+    # 090819NRT for each numeric column in turn
+    zz<-myRescale0to1(zscaled$longitude)
+    ordinalReadyforML<-sapply(zscaled,myRescale0to1)
+  } else {
+    ordinalReadyforML<-ordinals
+    }
+  # We now have a frame called ordinalReadyforML of just the numeric fields
+
+  # ************************************************
+  # IF SYMBOLIC TYPES:
+  # This function undertakes 1-hot-encoding
+  catagoricalReadyforML<-NPREPROCESSING_categorical(dataset,field_types)
+
+  # ************************************************
+  #Combine the two sets of data that are ready for ML
+  #These are now all numeric values
+  combinedML<-cbind(ordinalReadyforML,catagoricalReadyforML)
+
+  # Are any of the fields redundant?
+  combinedML<-NPREPROCESSING_redundantFields(combinedML,0.95)
+
+  #Any fields marked to "ignore" during pre-processing are included without change
+  toIgnore<-which(manualTypes$type==TYPE_IGNORE)
+  if (length(toIgnore)>0){
+    xx<-as.data.frame(dataset[,manualTypes$name[toIgnore]],drop=FALSE)
+    names(xx)<-manualTypes$name[toIgnore]
+    combinedML<-cbind(combinedML,xx)
+    }
+
+  #The dataset for ML information
+  print(paste("After Pre-Processing Total Fields=",ncol(combinedML)))
+
+  # ************************************************
+  # Returns the pre-processed dataset
+  return(combinedML)
+}
+
+# ************************************************
+# NreadDataset() :
+# Read a CSV file from working directory
+# INPUT: text - filename
+# OUTPUT : Frame - dataset
+# ************************************************
+NreadDataset<-function(csvFilename){
+  dataset<-read.csv(csvFilename,encoding="UTF-8",stringsAsFactors = FALSE)
+
+  #The field names "confuse" some of the library algorithms
+  #As they do not like spaces, punctuation, etc.
+  names(dataset)<-NPREPROCESSING_removePunctuation(names(dataset))
+
+  print(paste("CSV dataset",csvFilename,"has been read. Records=",nrow(dataset)))
+  return(dataset)
+}
+
+# ************************************************
+# NPREPROCESSING_removePunctuation()
+# INPUT: String - name of field with possible punctuation/spaces
+# OUTPUT : String - name of field with punctuation removed
+# ************************************************
+NPREPROCESSING_removePunctuation<-function(fieldName){
+  return(gsub("[[:punct:][:blank:]]+", "", fieldName))
+}
+
+# ************************************************
+# NPREPROCESSING_initialFieldType() :
+# Test each field for NUMERIC or SYNBOLIC
+# INPUT: Frame - dataset
+#        String - name of the field to manually set
+#        String - manual type
+# OUTPUT : int - index of name in the dataset
+# ************************************************
+NPREPROCESSING_setInitialFieldType<-function(name,type){
+
+  #Sets in the global environment
+  manualTypes<<-rbind(manualTypes,data.frame(name=name,type=type,stringsAsFactors = FALSE))
+}
+
+# ************************************************
+# NPREPROCESSING_initialFieldType() :
+# Test each field for NUMERIC or SYNBOLIC
+# INPUT: Frame - dataset
+#        Vector String - optional manual setting for each field
+#                        DISCREET, ORDINAL, SYMBOLIC
+# OUTPUT : Vector - List of types per field {NUMERIC, SYMBOLIC}
+# ************************************************
+NPREPROCESSING_initialFieldType<-function(dataset){
+
+  field_types<-vector()
+  for(field in 1:(ncol(dataset))){
+
+    entry<-which(manualTypes$name==names(dataset)[field])
+    if (length(entry)>0){
+      field_types[field]<-manualTypes$type[entry]
+      next
+    }
+
+    if (is.numeric(dataset[,field])) {
+        field_types[field]<-TYPE_NUMERIC
+      }
+    else {
+        field_types[field]<-TYPE_SYMBOLIC
+        }
+    }
+  return(field_types)
+}
+
+# ************************************************
+# NPREPROCESSING_discreetNumeric() :
+# Test NUMERIC field if DISCREET or ORDINAL
+# INPUT: Frame - dataset
+#        Vector - List of types per field {NUMERIC, SYMBOLIC}
+#        int - Number of empty bins needed to determine discreet (1-10)
+# OUTPUT : Vector - Updated Llist of types per field {DISCREET, ORDINAL}
+# ************************************************
+# Uses histogram equalisation
+# Plots histogram for visulisation
+# ************************************************
+NPREPROCESSING_discreetNumeric<-function(dataset,field_types,cutoff){
+
+  #For every field in our dataset
+  for(field in 1:(ncol(dataset))){
+
+    #Only for fields that are all numeric
+    if (field_types[field]==TYPE_NUMERIC) {
+
+      #Scale the whole field (column) to between 0 and 1
+      scaled_column<-myRescale0to1(dataset[,field])
+
+      #Generate the "cutoff" points for each of 10 bins
+      #so we will get 0-0.1, 0.1-0.2...0.9-1.0
+      cutpoints<-seq(0,1,length=11)
+
+      #This creates an empty vector that will hold the counts of ther numbers in the bin range
+      bins<-vector()
+
+      #Now we count how many numbers fall within the range
+      #length(...) is used to count the numbers that fall within the conditional
+      for (i in 2:11){
+        bins<-append(bins,length(scaled_column[(scaled_column<=cutpoints[i])&(scaled_column>cutpoints[i-1])]))
+      }
+
+      # the 10 bins will have a % value of the count (i.e. density)
+      bins<-(bins/length(scaled_column))*100.0
+
+      graphTitle<-"AUTO:"
+
+      #If the number of bins with less than 1% of the values is greater than the cutoff
+      #then the field is deterimed to be a discreet value
+
+      if (length(which(bins<1.0))>cutoff)
+          field_types[field]<-TYPE_DISCREET
+      else
+          field_types[field]<-TYPE_ORDINAL
+
+      #Bar chart helps visulisation. Type of field is the chart name
+      barplot(bins, main=paste(graphTitle,field_types[field]),
+              xlab=names(dataset[field]),
+              names.arg = 1:10,bty="n")
+
+    } #endif numeric types
+  } #endof for
+  return(field_types)
+}
+
+# ************************************************
+# NPREPROCESSING_categorical() :
+# Transform SYMBOLIC or DISCREET fields using 1-hot-encoding
+# INPUT: Frame - dataset
+#        Vector - List of types per field {ORDINAL, SYMBOLIC,DISCREET}
+#
+# OUTPUT : Frame - Converted fields with their rows of data
+# ************************************************
+# Small number of literals only otherwise too many dimensions
+# Uses 1-hot-encoding if more than 2 unique literals in the field
+# Otherwise converts the 2 literals into one field of {0,1}
+# ************************************************
+NPREPROCESSING_categorical<-function(dataset,field_types){
+
+  #This is a dataframe of the transformed categorical fields
+  catagorical<-data.frame(first=rep(NA,nrow(dataset)),stringsAsFactors=FALSE)
+
+  #For every field in our dataset
+  for(field in 1:(ncol(dataset))){
+
+    #Only for fields marked SYMBOLIC or DISCREET
+    if ((field_types[field]==TYPE_SYMBOLIC)||(field_types[field]==TYPE_DISCREET)) {
+
+      #Create a list of unique values in the field (each is a literal)
+      literals<-as.vector(unique(dataset[,field]))
+      numberLiterals<-length(literals)
+
+      #if there are just two literals in the field we can convert to 0 and 1
+      if (numberLiterals==2){
+        transformed<-ifelse (dataset[,field]==literals[1],0.0,1.0)
+        catagorical<-cbind(catagorical,transformed)
+        colnames(catagorical)[ncol(catagorical)]<-colnames(dataset)[field]
+
+      } else
+      {
+        #We have now to one-hot encoding FOR SMALL NUMBER of literals
+        if (numberLiterals<=MAX_LITERALS){
+          for(num in 1:numberLiterals){
+            nameOfLiteral<-literals[num]
+            hotEncoding<-ifelse (dataset[,field]==nameOfLiteral,1.0,0.0)
+
+            # 5/3/2018 - do not convert the field if their are too few literals
+            # Use log of number of recrods as the measure
+            literalsActive<-sum(hotEncoding==1)
+            if (literalsActive>log(length(hotEncoding))) {
+              catagorical<-cbind(catagorical,hotEncoding)
+              #060819 field name has the "_" seperator to make easier to read
+              colnames(catagorical)[ncol(catagorical)]<-paste(colnames(dataset)[field],
+                                                              "_",
+                                                              NPREPROCESSING_removePunctuation(nameOfLiteral),
+                                                              sep="")
+            }
+            else {
+              print(paste("Ignoring in field:",names(dataset)[field],
+                          "Literal:",nameOfLiteral,
+                          "Too few=",literalsActive))
+            }
+          }
+        } else {
+          stop(paste("Error - too many literals in:",names(dataset)[field], numberLiterals))
+        }
+
+      }
+    }
+  }
+
+  return(catagorical[,-1]) #Remove that first column that was full of NA due to R
+}
+
+# ************************************************
+# NplotOutliers() :
+# Scatter plot of field values and colours outliers in red
+# INPUT: Vector - sorted -  points to plot as literal values
+#        Vector - outliers - list of above points that are considered outliers
+#        String - fieldName - name of field to plot
+# OUTPUT : None
+# ************************************************
+NplotOutliers<-function(sorted,outliers,fieldName){
+
+  plot(1:length(sorted),sorted,pch=1,xlab="Unique records",ylab=paste("Sorted values",fieldName),bty="n")
+  if (length(outliers)>0)
+    points(outliers,sorted[outliers],col="red",pch=19)
+}
+
+# ************************************************
+# NPLOT_correlagram() :
+# Plots PLOT_correlagram
+# INPUT: Frame - cr - n x n frame of correlation coefficients for all fields
+# OUTPUT : None
+# ************************************************
+NPLOT_correlagram<-function(cr){
+  #Defines the colour range
+  col<-colorRampPalette(c("green", "red"))
+
+  #To fir on screen, convert field names to a numeric
+  rownames(cr)<-1:length(rownames(cr))
+  colnames(cr)<-rownames(cr)
+
+  corrplot::corrplot(cr,method="square",order="FPC",cl.ratio=0.2, cl.align="r",tl.cex = 0.6,cl.cex = 0.6,cl.lim = c(0, 1),mar=c(1,1,1,1),bty="n")
+}
+
+# ************************************************
+# NPREPROCESSING_redundantFields() :
+# Determine if an entire field is redundant
+# INPUT: Frame - dataset
+#        float - cutoff - Value above which is determined redundant (0.0-1.0)
+# OUTPUT : Frame - dataset with any fields removed
+# ************************************************
+# Uses LINEAR correlation, so use with care as information will be lost
+NPREPROCESSING_redundantFields<-function(dataset,cutoff){
+
+  print(paste("Before redundancy check Fields=",ncol(dataset)))
+
+  #Remove any fields that have a stdev of zero (i.e. they are all the same)
+  xx<-which(apply(dataset, 2, function(x) sd(x, na.rm=TRUE))==0)+1
+
+  if (length(xx)>0L)
+    dataset<-dataset[,-xx]
+
+  #Kendall is more robust for data do not necessarily come from a bivariate normal distribution.
+  cr<-cor(dataset, use="everything")
+  cr[(which(cr<0))]<-0 #Positive correlation coefficients only
+  NPLOT_correlagram(cr)
+
+  correlated<-which(abs(cr)>=cutoff,arr.ind = TRUE)
+  list_fields_correlated<-correlated[which(correlated[,1]!=correlated[,2]),]
+
+  if (length(list_fields_correlated)>0){
+
+    print("Following fields are correlated")
+    print(list_fields_correlated)
+
+    #We have to check if one of these fields is correlated with another as cant remove both!
+    v<-vector()
+    numc<-nrow(list_fields_correlated)
+    for (i in 1:numc){
+      if (length(which(list_fields_correlated[i,1]==list_fields_correlated[i:numc,2]))==0) {
+        v<-append(v,list_fields_correlated[i,1])
+      }
+    }
+    print("Removing the following fields")
+    print(names(dataset)[v])
+
+    return(dataset[,-v]) #Remove the first field that is correlated with another
+  }
+  return(dataset)
+}
+
+# ************************************************
+# NPREPROCESSING_outlier() :
+# Determine if a value of a record is an outlier for each field
+# INPUT:   frame - ordinals   - numeric fields only
+#          real  - confidence - Confidencevalue above which is determined an outlier [0,1]
+#                             - Set to negative value if NOT remove outliers
+# OUTPUT : frame - ordinals with any outlier values replaced with the median of the field
+# ************************************************
+# ChiSquared method
+# Uses   library(outliers)
+# https://cran.r-project.org/web/packages/outliers/outliers.pdf
+
+NPREPROCESSING_outlier<-function(ordinals,confidence){
+
+  #For every ordinal field in our dataset
+  for(field in 1:(ncol(ordinals))){
+
+    sorted<-unique(sort(ordinals[,field],decreasing=TRUE))
+    outliers<-which(outliers::scores(sorted,type="chisq",prob=abs(confidence))) #Updated 13/5/17 to include library name
+    NplotOutliers(sorted,outliers,colnames(ordinals)[field])
+
+    #If found records with outlier values
+    if ((length(outliers>0))){
+
+      #070819NRT If confidence is positive then replace values with their means, otherwise do nothing
+      if (confidence>0){
+        outliersGone<-rm.outlier(ordinals[,field],fill=TRUE)
+        sorted<-unique(sort(outliersGone,decreasing=TRUE))
+        #NplotOutliers(sorted,vector(),colnames(ordinals)[field])
+        ordinals[,field]<-outliersGone #Put in the values with the outliers replaced by means
+        print(paste("Outlier field=",names(ordinals)[field],"Records=",length(outliers),"Replaced with MEAN"))
+      } else {
+        print(paste("Outlier field=",names(ordinals)[field],"Records=",length(outliers)))
+      }
+    }
+
+  }
+  return(ordinals)
+}
+
+# ************************************************
+# NprintMeasures()
+#
+# Output measures to the Viewer
+#
+# INPUT:    List of results from NcalcConfusion()
+# OUTPUT :  NONE
+#
+# 070819NRT updated to output table to viewer only
+# ************************************************
+NprintMeasures<-function(results){
+
+  #This outputs our results into the "Viewer" in RStudio
+  tidyTable<-data.frame(t(t(results)))
+
+  t<-formattable::formattable(tidyTable,list(
+    TP = formatter("span",style = x ~ style(color = "black"),~sprintf("%.0f",TP)),
+    FN = formatter("span",style = x ~ style(color = "black"),~sprintf("%.0f",FN)),
+    TN = formatter("span",style = x ~ style(color = "black"),~sprintf("%.0f",TN)),
+    FP = formatter("span",style = x ~ style(color = "black"),~sprintf("%.0f",FP))))
+    print(t)
+}
+
+# ************************************************
+# NplotConfusion()
+#
+# Plot confusion matrix
+#
+# INPUT:    List of results from NcalcConfusion()
+# OUTPUT :  NONE
+#
+# 070819NRT Plots confusion matrix - copied from lab 8
+# ************************************************
+NplotConfusion<-function(results){
+
+  aa<-matrix(c(round(results$TP,digits=0),
+               round(results$FN,digits=0),
+               round(results$FP,digits=0),
+               round(results$TN,digits=0)),
+             nrow=2)
+  row.names(aa)<-c("Fraud","Genuine")
+  colnames(aa)<-c("Fraud","Genuine")
+  fourfoldplot(aa,color=c("#cc6666","#99cc99"),
+               conf.level=0,
+               margin=2,
+               main="TP  FP / FN   TN",bty="n")
+} #endof NplotConfusion()
+
+# ************************************************
+# Nrmse() : Calculate the RMSE statistic
+# INPUT: actual_y vector of real numbers indicating the known class
+#        y_predicted vector of real numbers indicating the predicted class
+# OUTPUT : Frame - dataset
+# ************************************************
+Nrmse<-function(actual_y,y_predicted){
+
+  return(sqrt(mean((actual_y-y_predicted)^2)))
+}
+# ************************************************
+# NcalcMeasures() : Evaluation measures for a confusion matrix
+# INPUT: numeric TP, FN, FP, TN
+#
+# OUTPUT: A list with the following entries:
+#        TP        - double - True Positive records
+#        FP        - double - False Positive records
+#        TN        - double - True Negative records
+#        FN        - double - False Negative records
+#        accuracy  - double - accuracy measure
+#        pgood     - double - precision for "good" (values are 1) measure
+#        pbad      - double - precision for "bad" (values are 1) measure
+#        FPR       - double - FPR measure
+#        TPR       - double - FPR measure
+#        TNR       - double - TNR measure
+#        MCC       - double - Matthew's Correlation Coeficient
+#
+# 080819NRT added TNR measure
+# ************************************************
+NcalcMeasures<-function(TP,FN,FP,TN){
+
+  retList<-list(  "TP"=TP,
+                  "FN"=FN,
+                  "TN"=TN,
+                  "FP"=FP,
+                  "accuracy"=100.0*((TP+TN)/(TP+FP+FN+TN)),
+                  "pgood"=   100.0*(TP/(TP+FP)),
+                  "pbad"=    100.0*(TN/(FN+TN)),
+                  "FPR"=     100.0*(FP/(FP+TN)),
+                  "TPR"=     100.0*(TP/(TP+FN)),
+                  "TNR"=     100.0*(TN/(FP+TN)),
+                  "MCC"=     ((TP*TN)-(FP*FN))/sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  )
+  return(retList)
+}
+
+# ************************************************
+# NcalcConfusion() : Calculate a confusion matrix for 2-class classifier
+# INPUT: vector - expected - {0,1}, Expected outcome from each row (labels)
+#        vector - predicted - {0,1}, Predicted outcome from each row (labels)
+#
+# OUTPUT: A list with the following entries:
+#        TP - int - True Positive records
+#        FP - int - False Positive records
+#        TN - int - True Negative records
+#        FN - int - False Negative records
+#        accuracy - float - accuracy measure
+#        pgood - float - precision for "good" (values are 1) measure
+#        pbad - float - precision for "bad" (values are 1) measure
+#        FPR - float - FPR measure
+#        TPR - float - FPR measure
+#        MCC - float - Matthew's Correlation Coeficient
+#
+# 070819NRT convert values to doubles to avoid integers overflowing
+# Updated to the following definition of the confusion matrix
+#
+#                    ACTUAL
+#               ------------------
+# PREDICTED     FRAUD   |  GENUINE
+#               ------------------
+#     FRAUD      TP     |    FP
+#               ==================
+#     GENUINE    FN     |    TN
+#
+#
+# ************************************************
+NcalcConfusion<-function(expected,predictedClass){
+
+  confusion<-table(factor(predictedClass,levels=0:1),factor(expected,levels=0:1))
+
+  TP<-as.double(confusion[2,2])
+  FN<-as.double(confusion[1,2])
+  FP<-as.double(confusion[2,1])
+  TN<-as.double(confusion[1,1])
+
+  return(NcalcMeasures(TP,FN,FP,TN))
+
+} #endof NcalcConfusion()
+
+# ************************************************
+# myRescale0to1() :
+# Scale the columns in the input object to [0.0,1.0]
+# scaled = x-min / max-min
+#
+# INPUT  : Object - values to scale
+# OUTPUT : Object - values scaled [0.0-1.0]
+#
+# ************************************************
+myRescale0to1<-function(x){
+  minv<-min(x)
+  maxv<-max(x)
+  return((x-minv)/(maxv-minv))
+} #endof myRescale0to1()
+
+# ************************************************
+# NROCgraph() : This is a ROC graph
+# INPUT:        Frame - dataset to create model
+#               Fame - dataset to test model
+# OUTPUT :      Float - calculated thresholkd from ROC
+#
+# 070819NRT - copied from lab 4 dataPrepFunctions.r
+# 210819NRT - Removed border from the plot & AUC text
+# ************************************************
+NROCgraph<-function(expected,predicted){
+
+  # y axis is sensitivity = % TPR
+  # x axis is specificity = % TNR or 1-FPR
+
+  rr<-pROC::roc(expected,predicted,
+          plot=TRUE,auc=TRUE, auc.polygon=TRUE,
+          percent=TRUE, grid=TRUE,print.auc=FALSE,
+          main="ROC Chart",bty="n")
+
+  #Selects the "best" threshold for lowest FPR and highest TPR
+  #070819NRT convert to data frame, added the transpose parameter
+  analysis<-as.data.frame(pROC::coords(rr, x="best",
+                         best.method="closest.topleft",
+                         transpose=FALSE,
+                         ret=c("threshold", "specificity",
+                                "sensitivity","accuracy",
+                                 "tn", "tp", "fn", "fp",
+                                 "npv","ppv")))
+
+  fpr<-round(100.0-analysis$specificity,digits=2L)
+  threshold<-analysis$threshold
+
+  #Add crosshairs to the graph
+  abline(h=analysis$sensitivity,col="red",lty=3,lwd=2)
+  abline(v=analysis$specificity,col="red",lty=3,lwd=2)
+
+  #Annote with text
+  text(x=analysis$specificity,
+       y=analysis$sensitivity,
+       adj = c(-0.2,2),
+       cex=1,
+       col="red",
+       paste("Threshold: ",round(threshold,digits=4L),
+             " TPR: ",round(analysis$sensitivity,digits=2L),
+             "% FPR: ",fpr,"%",sep=""))
+
+  print("Analysis from the ROC:")
+  print(analysis)
+
+  return(threshold)
+}
+
+# ************************************************
+# NPREPROCESSING_splitdataset() : #Randomise and split entire data set
+# INPUT: Frame - dataset
+#
+# OUTPUT : Frame - test dataset
+#          Frame - train dataset
+# ************************************************
+NPREPROCESSING_splitdataset<-function(combinedML){
+
+  # **** Create a TRAINING dataset using 70% of the records
+
+  combinedML<-combinedML[order(runif(nrow(combinedML))),]
+  training_records<-round(nrow(combinedML)*(70/100))
+
+  train <- 1:training_records
+  test <- -train
+
+  training_data <- combinedML[train,]
+  testing_data = combinedML[test,]
+
+  retList<-list("train"=training_data,
+                "test"=testing_data)
+  return(retList)
+}
+
+# ************************************************
+# NPREPROCESSING_prettyDataset()
+# Output simple dataset field analysis results as a table in "Viewer"
+#
+# REQUIRES: formattable
+#
+# INPUT: Frame - dataset, full dataset used for train/test of the neural network
+#              - Each row is one record, each column in named
+#              - Values are not scaled or encoded
+#        String - OPTIONAL string which is used in table as a header
+#
+# OUTPUT : none
+#
+# ************************************************
+NPREPROCESSING_prettyDataset<-function(dataset,...){
+
+  params <- list(...)
+
+  tidyTable<-data.frame(Field=names(dataset),
+                        Catagorical=FALSE,
+                        Symbols=0,
+                        Name=0,
+                        Min=0.0,
+                        Mean=0.0,
+                        Max=0.0,
+                        Skew=0.0,
+                        stringsAsFactors = FALSE)
+
+  if (length(params)>0){
+    names(tidyTable)[1]<-params[1]
+  }
+
+    for (i in 1:ncol(dataset)){
+    isFieldAfactor<-!is.numeric(dataset[,i])
+    tidyTable$Catagorical[i]<-isFieldAfactor
+    if (isFieldAfactor){
+      tidyTable$Symbols[i]<-length(unique(dataset[,i]))  #Number of symbols in catagorical
+      #Gets the count of each unique symbol
+      symbolTable<-sapply(unique(dataset[,i]),function(x) length(which(dataset[,i]==x)))
+      majoritySymbolPC<-round((sort(symbolTable,decreasing = TRUE)[1]/nrow(dataset))*100,digits=0)
+      tidyTable$Name[i]<-paste(names(majoritySymbolPC),"(",majoritySymbolPC,"%)",sep="")
+    } else
+    {
+      tidyTable$Max[i]<-round(max(dataset[,i]),2)
+      tidyTable$Mean[i]<-round(mean(dataset[,i]),2)
+      tidyTable$Min[i]<-round(min(dataset[,i]),2)
+      tidyTable$Skew[i]<-round(PerformanceAnalytics::skewness(dataset[,i],method="moment"),2)
+    }
+  }
+
+  #Sort table so that all numerics are first
+  t<-formattable::formattable(tidyTable[order(tidyTable$Catagorical),],
+                              list(Catagorical = formatter("span",style = x ~ style(color = ifelse(x,"green", "red")),
+                                             x ~ icontext(ifelse(x, "ok", "remove"), ifelse(x, "Yes", "No"))),
+                                             Symbols = formatter("span",style = x ~ style(color = "black"),x ~ ifelse(x==0,"-",sprintf("%d", x))),
+                                             Min = formatter("span",style = x ~ style(color = "black"), ~ ifelse(Catagorical,"-",format(Min, nsmall=2, big.mark=","))),
+                                             Mean = formatter("span",style = x ~ style(color = "black"),~ ifelse(Catagorical,"-",format(Mean, nsmall=2, big.mark=","))),
+                                             Max = formatter("span",style = x ~ style(color = "black"), ~ ifelse(Catagorical,"-",format(Max, nsmall=2, big.mark=","))),
+                                             Skew = formatter("span",style = x ~ style(color = "black"),~ ifelse(Catagorical,"-",sprintf("%.2f", Skew)))
+  ))
+  print(t)
+}
+
+
+#  MANM354 MACHINE LEARNING & VISULISATION
+#
+# UPDATE
+# 1.00      1/2/2017    Initial Version
+# 1.10      24/2/2019   Only code for rule output now inlcuded
+# 1.11      8/8/2019    N_DEEP_Initialise()
+# 1.12      20/8/19     Split deep NN into N_DEEP_Train(), N_DEEP_Eval()
+#
+# ************************************************
+
+# ************************************************
+# tbd() :
+# INPUT: text - filename
+# OUTPUT : Frame - dataset
+# ************************************************
+NprintDTRules<-function(dtrules, filename){
+
+  sink(filename)
+
+  for (r in 1:nrow(dtrules)){
+    print(paste("[",r,"]",dtrules$Rule[r],"==",(ifelse(dtrules$Class[r]==0,"BAD","GOOD"))))
+  }
+  sink()
+}
+# ************************************************
+# DECISION TREE CONVERT DT RULES TO ASCII FORMATTED RULES AND WRITE TO CSV FILE
+# <anticedent 1> AND <anticedent 2> ...
+# Each anticedent is: [field][comparision][value]
+# INPUT: Object - Trained tree
+# OUTPUT: data frame of rules, class and anticedents
+# ************************************************
+NDT5RuleOutput<-function(tree){
+  #library(stringr)
+  x<-summary(tree)[1]
+  x<-substr(x,regexpr("Rules:",x)[1]+8,nchar(x))
+  x<-substr(x,1,regexpr("Evaluation on training data",x)[1]-1)
+  x<-gsub("[\n\t]", "*", x)
+  df_of_rules<-data.frame(matrix(ncol=3,nrow=tree$size),stringsAsFactors = FALSE)
+  df_of_rules<-setNames(df_of_rules,c("Rule","Class","Anti"))
+
+  numberofrules<-tree$size
+  totalAnticedents<-0
+  for (ruleNumber in 1:numberofrules){
+    start<-regexpr("\\*\\*",x)[1]+2
+    end<-regexpr("->",x)[1]-3
+    onerule<-substr(x,start,end) #Single rule, anticedents seperated by '**'
+    onerule<-gsub("\\*\\*"," AND ",onerule) #Rule now has "AND" between anticedents
+    #onerule<-convertNormalisedDTRuleToRealWorld(onerule)
+    NumAnticedents<-str_count(onerule,"AND")+1
+    totalAnticedents=totalAnticedents+NumAnticedents
+    classpos<-regexpr("class ",x)+6
+    classID<-as.numeric(substr(x,classpos,classpos))  #This has the class of the rule, i.e. {0,1}
+    df_of_rules$Rule[ruleNumber]<-onerule
+    df_of_rules$Class[ruleNumber]<-classID
+    df_of_rules$Anti[ruleNumber]<-NumAnticedents
+    x<-substr(x,classpos,nchar(x))
+    st<-regexpr("\\*\\*",x)[1]+2 #move past the rule ID
+    x<-substr(x,st,nchar(x))
+  }
+  return(df_of_rules)
+}
+
+# ************************************************
+# LEARN_BasicNeural() : Train a simple MLP Neural Network classifier
+# INPUT: Frame - training_data - scaled [0.0,1.0], fields & rows
+#        String - fieldNameOutput - Name of the field that we are training on (i.e.Status)
+#        int - hiddenNeurons - Number of hidden layer neurons
+#        double - threshold - error value under which the training stops [0.0,1.0]
+#        int - trainRep - number of repetitions for the neural network’s training
+# OUTPUT : Frame - information, including the learn weights, of the MLP classifier
+# ************************************************
+# Uses   library(neuralnet)
+# https://cran.r-project.org/web/packages/neuralnet/neuralnet.pdf
+# Trains a 3 layer, MLP neural network
+# Selected a resilient back-propagation with and without weight backtracking algorithm
+# Logistic (i.e. sigmoidal) neuron transfer functions so scaled [0.0,1.0]
+# Will be slow & no test for overfitting the model
+
+N_LEARN_BasicNeural<-function(training_data,fieldNameOutput,
+                              hiddenNeurons,threshold,trainRep){
+
+  #library(neuralnet)
+
+  inputs<-paste(colnames(training_data)[which(names(training_data)!=fieldNameOutput)],collapse = "+")
+  output<-paste(fieldNameOutput,"~")
+  passtofunction=paste(output,inputs,sep=" ")
+
+  print("Training Shallow MLP Neural Network")
+  mlp_classifier<-neuralnet(passtofunction,data=training_data,
+                            hidden=hiddenNeurons,
+                            linear.output=FALSE,
+                            act.fct = 'logistic',
+                            algorithm="rprop+",
+                            threshold = threshold,rep=trainRep)
+
+  return(mlp_classifier)
+}
+
+# ************************************************
+# EVALUATE_BasicNeural() : Evaluate a simple MLP Neural Network classifier
+#                           Generates predicted classifications from the classifier
+# INPUT: Frame - testing_data - scaled [0.0,1.0], fields & rows
+#        String - fieldNameOutput - Name of the field that we are training on (i.e.Status)
+#        Frame - mlp_classifier - structure including the learn weights, of the MLP classifier
+# OUTPUT :None
+# ************************************************
+# Uses   library(neuralnet)
+# https://cran.r-project.org/web/packages/neuralnet/neuralnet.pdf
+
+N_EVALUATE_BasicNeural<-function(testing_data,fieldNameOutput, mlp_classifier){
+
+  positionOutput<-which(names(testing_data)==fieldNameOutput)
+
+  res<-compute(mlp_classifier,testing_data[,-positionOutput])$net.result
+
+  return(as.vector(res))
+}
+
+# ************************************************
+# N_DEEP_Initialise()
+#
+# Initialise the H2O server
+#
+# INPUT: none
+# OUTPUT : none
+# ************************************************
+N_DEEP_Initialise<-function(reproducible){
+
+  library(h2o)
+
+  print("Initialise the H2O server")
+  #Initialise the external h20 deep learning local server if needed
+  #130517NRT - set nthreads to -1 to use maximum so fast, but set to 1 to get reproducable results
+  #080819NRT - uses parameter reproducible
+  if (reproducible==TRUE)
+    nthreads<-1
+  else
+    nthreads<- -1
+
+  h2o.init(max_mem_size = "5g",nthreads = nthreads)
+  #h2o.no_progress()
+}
+
+# ************************************************
+# N_DEEP_TrainClassifier()
+#
+# H2o NEURAL NETWORK : DEEP LEARNING CLASSIFIER TRAIN
+#
+# INPUT:  Frame         - train              - scaled [0.0,1.0], fields & rows
+#         Frame         - test               - scaled [0.0,1.0], fields & rows
+#         String        - fieldNameOutput    - Name of the field that we are training on (i.e.Status)
+#         Int Vector    -  hidden            - Number of hidden layer neurons for each layer
+#         int           - stopping_rounds    - Number of times no improvement before stop
+#         double         - stopping_tolerance - Error threshold
+#         String        - activation         - Name of activation function
+#         Bool          - reproducible       - TRUE for eproducable each run
+#
+# OUTPUT: double Vector - probabilities of class 1
+# ************************************************
+N_DEEP_TrainClassifier<- function(train,
+                                  test,
+                                  fieldNameOutput,
+                                  hidden,
+                                  stopping_rounds,
+                                  stopping_tolerance,
+                                  activation,
+                                  reproducible){
+
+  positionOutput<-which(names(test)==fieldNameOutput)
+
+  #Creates the h2o training dataset
+  train[fieldNameOutput] <- lapply(train[fieldNameOutput] , factor) #Output class has to be a R "factor"
+  train_h2o <- as.h2o(train, destination_frame = "traindata")
+
+  #Creates the h2o test dataset
+  test[fieldNameOutput] <- lapply(test[fieldNameOutput] , factor) #Output class has to be a R "factor"
+  test_h2o <- as.h2o(test, destination_frame = "testdata")
+
+  #This lists all the input field names ignoring the fieldNameOutput
+  predictors <- setdiff(names(train_h2o), fieldNameOutput)
+
+  #Deep training neural network.  NOTE: Should use cross-validation with a test dataset
+  #Updated 13/5/17 - set reproducible = TRUE so that the same random numbers are used to initalise
+
+  deep<-h2o.deeplearning(x=predictors,y=fieldNameOutput,training_frame = train_h2o,
+                         epochs=200,
+                         hidden=hidden,
+                         adaptive_rate=TRUE,
+                         stopping_rounds=stopping_rounds,
+                         stopping_tolerance=stopping_tolerance,
+                         fast_mode=FALSE,
+                         activation=activation,
+                         seed=1234,
+                         reproducible = reproducible)
+
+  # TEST IF THE MODEL IS REPRODUCABLE OTHERWISE ABORT
+  # CHANGE TO TRUE IF DEBUGGING CODE
+  if (FALSE){
+
+    #calculate AUC for first model
+    auc1<-h2o.auc(deep)
+
+    deep<-h2o.deeplearning(x=predictors,y=fieldNameOutput,training_frame = train_h2o,
+                           epochs=100,
+                           hidden=hidden,
+                           adaptive_rate=TRUE,
+                           stopping_rounds=stopping_rounds,
+                           stopping_tolerance=stopping_tolerance,
+                           fast_mode=FALSE,
+                           activation=activation,
+                           seed=1234,
+                           reproducible = reproducible)
+
+    auc2<-h2o.auc(deep)
+
+    if (auc1!=auc2)
+      stop("DEEP LEARN IS NOT REPRODUCABLE")
+  }
+
+  if (FALSE){
+    # ************************************************
+    # TELL ME SOMETHING INTERESTING...
+    summary(deep)
+    plot(deep)  # plots the scoring history
+
+    # variable importance
+    var_imp = h2o.varimp(deep)
+
+    for (rows in 1:nrow(var_imp)){
+      print(paste(var_imp$variable[rows],
+                  round(var_imp$scaled_importance[rows],digits=3),
+                  round(var_imp$percentage[rows],digits=2)))
+    }
+  }
+
+  # ************************************************
+
+  pred <- h2o.predict(deep, test_h2o)
+
+  res<-as.vector(pred[,3])  #Returns the probabilities of class 1
+  return(res)
+}
+
+
+# ************************************************
+# N_DEEP_Train
+#
+# H2o NEURAL NETWORK :
+# DEEP LEARNING CLASSIFIER TRAIN
+#
+# INPUT:  Frame         - train              - scaled [0.0,1.0], fields & rows
+#         String        - fieldNameOutput    - Name of the field that we are training on (i.e.Status)
+#         Int Vector    -  hidden            - Number of hidden layer neurons for each layer
+#         int           - stopping_rounds    - Number of times no improvement before stop
+#         double         - stopping_tolerance - Error threshold
+#         String        - activation         - Name of activation function
+#
+# OUTPUT: Object        - h2o trained neural network
+# ************************************************
+N_DEEP_Train<-function(train,
+                        fieldNameOutput,
+                        hidden,
+                        stopping_rounds,
+                        stopping_tolerance,
+                        activation){
+
+  positionOutput<-which(names(train)==fieldNameOutput)
+
+  #Creates the h2o training dataset
+  train[fieldNameOutput] <- lapply(train[fieldNameOutput] , factor) #Output class has to be a R "factor"
+  train_h2o <- as.h2o(train, destination_frame = "traindata")
+
+  #This lists all the input field names ignoring the fieldNameOutput
+  predictors <- setdiff(names(train_h2o), fieldNameOutput)
+
+  deep<-h2o.deeplearning(x=predictors,y=fieldNameOutput,training_frame = train_h2o,
+                         epochs=200,
+                         hidden=hidden,
+                         adaptive_rate=TRUE,
+                         stopping_rounds=stopping_rounds,
+                         stopping_tolerance=stopping_tolerance,
+                         fast_mode=FALSE,
+                         activation=activation,
+                         seed=1234,
+                         reproducible = TRUE)
+  return(deep)
+}
+
+# ************************************************
+# N_DEEP_Train
+#
+# H2o NEURAL NETWORK :
+# DEEP LEARNING CLASSIFIER TRAIN
+#
+# INPUT:  Object         - deep              - h2o deep neural network
+#         Frame         - test               - scaled [0.0,1.0], fields & rows
+#         String        - fieldNameOutput    - Name of the field that we are training on (i.e.Status)
+#
+# OUTPUT: double Vector - probabilities of class 1
+# ************************************************
+N_DEEP_Eval<-function(deep,
+                       test,
+                       fieldNameOutput){
+
+  positionOutput<-which(names(test)==fieldNameOutput)
+
+  #Creates the h2o test dataset
+  test[fieldNameOutput] <- lapply(test[fieldNameOutput] , factor) #Output class has to be a R "factor"
+  test_h2o <- as.h2o(test, destination_frame = "testdata")
+
+  pred <- h2o.predict(deep, test_h2o)
+
+  res<-as.vector(pred[,3])  #Returns the probabilities of class 1
+  return(res)
+}
+
+# ************************************************
+# N_DEEP_Train
+#
+# H2o NEURAL NETWORK :
+# DEEP LEARNING CLASSIFIER TRAIN
+#
+# INPUT:  Object         - deep              - h2o deep neural network
+#
+# OUTPUT: Data frame     - field, importance
+# ************************************************
+N_DEEP_Importance<-function(deep){
+
+  # variable importance
+  var_imp = h2o.varimp(deep)
+
+  return(var_imp)
+}
+
+
+
+
+
+# FRAUD PATTERN DRIFT ANALYSIS
+# CLUSTER ANALYSIS
+#
+# UPDATE
+# 1.00      7/8/2019   Initial Version
+#
+# ************************************************
+
+# Confusion matrix is defined as:
+#
+#                    ACTUAL
+#               ------------------
+# PREDICTED     FRAUD   |  GENUINE
+#               ------------------
+#     FRAUD      TP     |    FP
+#               ==================
+#     GENUINE    FN     |    TN
+
+
+# Clears all objects in "global environment"
+rm(list=ls())
+
+# ************************************************
+# Global variables
+# ************************************************
+
+# Input dataset
+DATASET_PREPROCESSED <-"FICOpreprocessed.csv"     # preprocessed and scaled dataset
+DATASET_COMBINED    <- "FICOcombined.csv"         # original dataset with inputs, fraud and day
+
+# Output datasets, created for further analysis in Excel, etc.
+DATASET_FRAUDCLUSTER <-"FICOfraudTypes.csv"                                # just fraud records with their allocated type (cluster)
+
+OUTPUT_FIELD         <- "fraud"
+
+
+START_CLUSTER     <-10                           # Number of initial cluster points
+MAX_CLUSTERS      <-30                           # Maximum clusters to determine
+
+# ************************************************
+# clusterDatasetFraud() : From lab 6
+#
+# INPUT:    Frame - dataset - scaled and preprocessed dataset
+# OUTPUT :  None
+# ************************************************
+clusterDatasetFraud<-function(dataset){
+
+  # Selects just the fraud records
+  frauds<-subset(dataset,fraud==1)
+
+  print(paste("This will be slow! Clustering fraud records of",nrow(frauds)))
+
+  # Just the input fields to cluster
+  # Remove fields that we do not wish to model
+  predictors<-frauds[ , !(names(frauds) %in% c("day",
+                                               "fraud",
+                                               "state1"
+  ))]
+
+  # ************************************************
+  # Gap statistic method to find optimal number for k
+  # Compares the total intracluster variation for different values of k
+  # with their expected values when there is no obvious clustering in the data
+
+  gap_stat <- cluster::clusGap(predictors,
+                               FUN = kmeans,
+                               nstart = START_CLUSTER,
+                               K.max = MAX_CLUSTERS,
+                               B = 15,
+                               d.power = 2 )
+
+  p<-factoextra::fviz_gap_stat(gap_stat)
+  print(p)
+
+  # ************************************************
+  # Select the optimal number of clusters
+  # This is the "elbow point"
+
+  maxgap<-gap_stat$Tab[,"gap"][1]
+  for (optimumCluster in 2:nrow(gap_stat$Tab)){
+    gap<-gap_stat$Tab[,"gap"][optimumCluster]
+    if (gap<maxgap){
+      break
+    }
+    maxgap<-gap
+  }
+  optimumCluster<-optimumCluster-1
+  print(paste("Optimum nuber of clusters (fraud types)=",optimumCluster))
+
+  # ************************************************
+  # Now build a cluster model using the optimal number of clusters
+  modelKmeans <- kmeans(predictors, centers=optimumCluster,nstart=START_CLUSTER)
+
+  # cluster plot
+  # Some of the fields might be constants, which we have to remove to use
+  # principal components to plot n-dimensions onto a 2d chart
+  # This line removes lines that have 0 variance
+
+  pp<-predictors[,apply(predictors, 2, var, na.rm=TRUE) != 0]
+
+  p<-factoextra::fviz_cluster(modelKmeans, data = pp,geom = "point")
+  print(p)
+
+  # ************************************************
+  # Output summary statistics for each cluster
+  # This gives a view as to the TYPE of frauds
+  # Use the original dataset so output the real-world values
+  # Rather than the scaled values
+  # This could be better visuaised here!
+
+  # Read in the original values - as easier to understand these!
+  prepareDataset<-read.csv(file=DATASET_COMBINED,encoding="UTF-8",header=TRUE, stringsAsFactors = FALSE)
+
+  # Selects just the fraud records and appends the cluster ID (i.e. fraud type)
+  fraudTypes<-subset(prepareDataset,fraud==1)
+  fraudTypes$cluster<-modelKmeans$cluster
+
+  for (k in 1:optimumCluster){
+    tableTitle<-paste("Cluster=",k,sep="")
+    NPREPROCESSING_prettyDataset(subset(fraudTypes,cluster==k),tableTitle)
+  }
+
+  # ************************************************
+  # Output the fraud records only with the cluster ID as a dataset
+  write.csv(fraudTypes,file=DATASET_FRAUDCLUSTER, row.names=FALSE)
+  print(paste("Write CSV dataset",DATASET_FRAUDCLUSTER,
+              "Records=",nrow(fraudTypes),
+              "Fields=",ncol(fraudTypes)))
+
+  # ************************************************
+  # FORCE TO SAY 4 CLUSTERS
+
+  FORCED_CLUSTER<-4
+
+  modelKmeans <- kmeans(predictors, centers=FORCED_CLUSTER,nstart=START_CLUSTER)
+
+  # cluster plot
+  # Some of the fields might be constants, which we have to remove to use
+  # principal components to plot n-dimensions onto a 2d chart
+  # This line removes lines that have 0 variance
+
+  pp<-predictors[,apply(predictors, 2, var, na.rm=TRUE) != 0]
+
+  p<-factoextra::fviz_cluster(modelKmeans, data = pp,geom = "point")
+  print(p)
+
+} #endof clusterDatasetFraud()
+
+
+# ************************************************
+# main() : main entry point
+# INPUT:   None
+# OUTPUT : None
+# ************************************************
+main<-function(){
+
+  # ************************************************
+  # Read preprocessed dataset. Split into train and verify by days
+  # Output dataset info on the console
+  # "fraud" is encoded as: 1 = Fraud, 0 = Genuine
+
+  dataset<-read.csv(file=DATASET_PREPROCESSED,encoding="UTF-8",header=TRUE, stringsAsFactors = FALSE)
+
+  print(paste("CSV dataset",DATASET_PREPROCESSED,
+              "has been read. Records=",nrow(dataset),
+              "Fields=",ncol(dataset)))
+
+  # ************************************************
+  # Cluster just the fraud records to examine the different fraud types
+  # This will be useful for the concept drift experiments
+   clusterDatasetFraud(dataset)
+
+
+} #endof main()
+
+# ************************************************
+# R starts execution
+
+# Clears all warning messages
+assign("last.warning", NULL, envir = baseenv())
+
+# clears the console area
+cat("\014")
+
+# ************************************************
+print("START CLUSTER FRAUD VECTORS")
+
+# Define and then load the libraries used in this project
+myLibraries<-c(
+  "cluster",
+  "formattable"
+)
+
+library(pacman)
+pacman::p_load(char=myLibraries,install=TRUE,character.only=TRUE)
+
+# ************************************************
+#Load additional R script files provide for this lab
+source("4labFunctions.R")
+source("6dataPrepFunctions.R")
+
+# ************************************************
+set.seed(123)
+
+main()
+
+print("END")
+
+
+
+
+
+# FRAUD PATTERN DRIFT ANALYSIS
+# TRAIN AND EVALUATE NEURAL ML MODELS
+# 7th August 2019
+#
+# UPDATE
+# 1.00      7/8/2019   Initial Version
+# 1.01      13/8/2019  Removed clustering to a seperate script
+# 1.02      19/8/2019  Seperated experiments.  Added drift experiment
+# 1.03      20/8/2019  Calculate daily measures, updated deep learning
+#
+# ************************************************
+
+# Confusion matrix is defined as:
+#
+#                    ACTUAL
+#               ------------------
+# PREDICTED     FRAUD   |  GENUINE
+#               ------------------
+#     FRAUD      TP     |    FP
+#               ==================
+#     GENUINE    FN     |    TN
+
+
+# Clears all objects in "global environment"
+rm(list=ls())
+
+# ************************************************
+# Global variables
+# ************************************************
+
+# Input dataset
+DATASET_PREPROCESSED <-"FICOpreprocessed.csv"     # preprocessed and scaled dataset
+DATASET_COMBINED    <- "FICOcombined.csv"         # original dataset with inputs, fraud and day
+
+# Output datasets, created for further analysis in Excel, etc.
+DATASET_TXVOLUME     <-"FICOtx.csv"
+
+OUTPUT_FIELD         <- "fraud"
+
+DAYSTOTRAIN          <- 30                       # Number of days to train initialmodel
+
+KFOLDS               <-2                         # Stratified cross validation folds
+
+DEEP_HIDDEN          <- c(50,30)                 # Number of neurons in each layer
+DEEP_STOPPING        <- 5                        # Number of times no improvement before stop
+DEEP_TOLERANCE       <- 1e-2                     # Error threshold
+DEEP_ACTIVATION      <- "Tanh"                   # Non-linear activation function
+
+RESULTS_NEURALMODEL  <-"neuralResults.csv"       # Results file of k-fold neural models
+RESULTS_NEURALDAY    <-"dayResults.csv"          # Results file of neural model per day eval
+RESULTS_DRIFT        <-"driftResults"            # Results file from drift experiments
+RESULTS_IMPORTANCE   <-"importanceResults"       # Results file of field importance in NN
+RESULTS_NEURALDAYT   <-"newTypeDayResults.csv"   # Results file after simulating a new fraud vector
+RESULTS_COMBINED     <-"combined.csv"            # Results after detecting drift & retraining
+
+FORCED_CLUSTER    <-4                           # Fix the number of clusters, you can experiment with this!
+START_CLUSTER     <-10                          # Number of initial cluster points
+
+METRIC_PERIOD     <-14                          # set to 14 day average as metric to determine re-train
+DRIFT_THRESHOLD   <-40                          # Max % of missed frauds before model is retrained
+
+# ************************************************
+# allocateFoldID() :
+# Add a new field to the dataset that has a fold ID
+# INPUT:
+#         Frame         - split       - train dataset
+#
+# OUTPUT :
+#         Frame         - split       - train dataset with "foldIds" added as a field
+# ************************************************
+allocateFoldID<-function(split){
+
+  recordsPerFold<-ceiling(nrow(split)/KFOLDS)
+  foldIds<-rep(seq(1:KFOLDS),recordsPerFold)
+  foldIds<-foldIds[1:nrow(split)]
+  split$foldIds<-foldIds
+  return(split)
+
+} #endof allocateFoldID()
+
+# ************************************************
+# runExperiment() :
+# Train h2o deep neural network. Determine threshold,
+# evaluate performance using the test dataset
+#
+# INPUT:
+#         Frame         - trainDataset       - train dataset
+#         Frame         - testDataset        - test dataset
+#
+# OUTPUT: Vector        - predicted class for test dataset
+# ************************************************
+runExperiment<-function(trainDataset,testDataset){
+
+  # Train the neural network
+  deep<-N_DEEP_Train(trainDataset,
+                     OUTPUT_FIELD,
+                     DEEP_HIDDEN,
+                     DEEP_STOPPING,
+                     DEEP_TOLERANCE,
+                     DEEP_ACTIVATION)
+
+  # Evaluate the neural network
+  test_predicted<-N_DEEP_Eval(deep,
+                              testDataset,
+                              OUTPUT_FIELD)
+
+  # ************************************************
+  # Evaluate this model against the unseen test dataset
+
+  test_expected<-testDataset[,OUTPUT_FIELD]
+  threshold<-NROCgraph(test_expected,test_predicted)  # Determine "best" threshold
+
+  # Threshold maximises TPR and minimises FPR
+  # Convert the probabilities from the classifier into "decisions" i.e. 1=fraud, 0=genuine
+  test_predicted_class<-ifelse(test_predicted>=threshold,1,0)
+  print(paste("DEEP LEARNING ROC threshold=",threshold))
+
+  return(test_predicted_class)
+  } #endof runExperiment()
+
+# ************************************************
+# plotTransactionVolume :
+# Plot line chart of transaction volume each day
+# INPUT:
+#         Frame         - dataset       -  dataset of transactions
+#         String        - title         -  name of chart
+#
+# OUTPUT :
+#         None
+# ************************************************
+plotTransactionVolume<-function(dataset,title){
+
+  frv<-subset(dataset,fraud==1)
+  frg<-subset(dataset,fraud==0)
+
+  plot(table(frg$day),type="l",col="green",
+       main=paste("Transaction Volume per Day",title),
+       xlab="Day",ylab="Number of Transactions",bty="n")
+
+  lines(table(frv$day),col="red",type="l")
+
+  legend("topright", legend=c("Genuine", "Fraud"),
+         col=c("green", "red"), lty=1, cex=0.8)
+} #endof plotTransactionVolume()
+
+# ************************************************
+# fraudClassifier :
+# EXPERIMENT 1 - BUILD AND EVALUATE A FRAUD CLASSIFIER
+# Train and evaluate a neural network
+# Use Stratified k-fold cross validation
+# INPUT:
+#         Frame         - dataset       -  dataset of transaction
+#
+# OUTPUT :
+#         None
+# ************************************************
+fraudClassifier<-function(trainDataset){
+  print("EXPERIMENT 1 - BUILD AND EVALUATE A FRAUD CLASSIFIER")
+
+  # ************************************************
+  # Stratified cross validation dataset
+  # Create a column that indicates the fold number for each class
+
+  split1<-allocateFoldID(subset(trainDataset,fraud==1))
+  split2<-allocateFoldID(subset(trainDataset,fraud==0))
+
+  # Combine the two classes
+  newDataset<-rbind(split1,split2)
+
+  # Randomise the dataset
+  newDataset<-newDataset[order(runif(nrow(newDataset))),]
+
+  # ************************************************
+  # For k times, run the experiment
+
+  allResults<-data.frame()
+
+  for (k in 1:KFOLDS){
+
+    #Create the train dataset for fold k
+    #Remove the fields day, state1,foldIds as not used as inputs to NN
+    trainDataset<-subset(newDataset, foldIds!=k,select=c(-day,-state1,-foldIds))
+
+    #Create the test dataset
+    #Remove the state1 field, leave in the day, as wil need this!
+    testDataset<-subset(newDataset, foldIds==k, select=c(-state1,-foldIds))
+
+    # Train and evaluate a neural network on each fold
+    # Remove day field from the test dataset
+    print(paste("Training model for fold k=",k))
+    test_predicted_class<-runExperiment(trainDataset,subset(testDataset,select=-day))
+
+    # Calculates confusion matrix and then standard measures
+    # TP, FN, TN, FP, accuracy [evil], pgood, pbad, FPR, TPR, TNR, MCC
+    results<-data.frame(NcalcConfusion(testDataset[,OUTPUT_FIELD],test_predicted_class))
+
+    # Calculate daily measures
+    daysInTestDataset<-length(unique(testDataset$day))
+    results$meanAlertsD<-(results$TP+results$FP)/daysInTestDataset  # Number of alerts that are generated each day
+    results$FraudD<-results$TP/daysInTestDataset  # Number of frauds CORRECT per day
+    results$MissedD<-results$FN/daysInTestDataset # Number of frauds MISSED per day
+
+    row.names(results)<-paste("Fold",k)
+    allResults<-rbind(allResults,results)
+  } #endof for() all folds
+
+  # ************************************************
+  # Calculate the MEAN measures over all the folds
+  meanMeasures<-data.frame(t(colMeans(allResults)))
+  row.names(meanMeasures)<-"Mean"
+  allResults<-rbind(allResults,meanMeasures)
+
+  # Calculate the STANDARD DEVIATION over all folds for all measures
+  stdMeasures<-data.frame(t(apply(allResults,2,sd)))
+  row.names(stdMeasures)<-"Std Dev"
+  allResults<-rbind(allResults,stdMeasures)
+
+  write.csv(allResults,file=RESULTS_NEURALMODEL,row.names=TRUE)
+
+  NprintMeasures(allResults)
+  NplotConfusion(meanMeasures)
+
+} #endof fraudClassifier()
+
+# ************************************************
+# fieldImportance :
+# EXPERIMENT 2 - DETERMINE FIELD IMPORTANCE IN THE NEURAL NETWORK
+# Train on entre dataset and determine the field importance
+# Use Stratified k-fold cross validation
+# INPUT:
+#         Frame         - dataset       -  dataset of transaction
+#
+# OUTPUT :
+#         None
+# ************************************************
+fieldImportance<-function(trainDataset){
+
+  print("EXPERIMENT 2 - DETERMINE FIELD IMPORTANCE IN THE NEURAL NETWORK")
+
+  # Determine the "importance" of the input fields to the NN
+  # Train the neural network on entire dataset and then run analysis
+  # Remove the fields day, state1,foldIds as not used as inputs to NN
+  trainDataset<-subset(trainDataset, select=c(-day,-state1))
+
+  deep<-N_DEEP_Train(trainDataset,
+                     OUTPUT_FIELD,
+                     DEEP_HIDDEN,
+                     DEEP_STOPPING,
+                     DEEP_TOLERANCE,
+                     DEEP_ACTIVATION)
+
+  importance<-N_DEEP_Importance(deep)
+
+  write.csv(importance,file=RESULTS_IMPORTANCE,row.names=TRUE)
+  NprintMeasures(importance)
+  print("done")
+  }
+
+# ************************************************
+# evalByDay :
+#
+#
+#
+# INPUT:
+#         Frame         - dataset       -  dataset of transaction
+#
+# OUTPUT :
+#         None
+# ************************************************
+evalByDay<-function(trainDataset,verifyDataset,title, resultsFile){
+
+  # ************************************************
+  # Train model and then evaluate per day
+  # Train on dataset, evaluate performance PER DAY
+  conceptDriftAnalysis<-function(trainDataset,evalDataset){
+
+    # Output performance metric chart with trend lines
+    trendChart<-function(day,metric,maintitle,title){
+      spatialEco::trend.line(day,
+                             metric,
+                             type='linear',
+                             plot=TRUE,
+                             pch=20,
+                             main=maintitle,
+                             xlab="day",
+                             sub=title,
+                             bty="n")
+    } #endof trendChart()
+
+    predicted_class<-runExperiment(subset(trainDataset,select=-day),subset(evalDataset,select=-day))  #Remove day as an input field
+    evalDataset$predicted<-predicted_class
+
+    # Calculate metrics for each day
+    allResults<-data.frame()
+
+    for(i in min(evalDataset$day):max(evalDataset$day)){
+      oneday<-subset(evalDataset,day==i)
+      results<-data.frame(NcalcConfusion(oneday[,OUTPUT_FIELD],oneday$predicted))
+      results$day<-i
+      results$meanAlertsD<-(results$TP+results$FP) # Number of alerts that are generated each day
+      results$pcFraudD<-100*(results$TP/results$meanAlertsD)                  # % of daily alerts that are correctly identified as fraud
+      results$pcMissedD<-100*(results$FN/(results$TP+results$FN))             # % of frauds MISSED out of all frauds per day
+      allResults<-rbind(allResults,results)
+    } #endof for()
+
+    # Output as charts with trend lines
+    # Change to TRUE to output these charts
+    if (FALSE){
+      trendChart(allResults$day,allResults$pgood,"%pFraud - Frauds in all alerts",title)
+      trendChart(allResults$day,allResults$pbad,"%pFraud - Genuines in all alerts",title)
+      trendChart(allResults$day,allResults$FPR,"%FPR - Genuine wrongly alerted",title)
+      trendChart(allResults$day,allResults$TPR,"%TPR - Fraud correctly alerted",title)
+      trendChart(allResults$day,allResults$TNR,"%TNR - Correctly classified genuines",title)
+      trendChart(allResults$day,allResults$MCC,"MCC",title)
+
+      trendChart(allResults$day,allResults$meanAlertsD,"Alerts per day",title)
+      trendChart(allResults$day,allResults$pcFraudD,"% daily alerts that are correctly identified as fraud",title)
+      trendChart(allResults$day,allResults$pcMissedD,"% frauds MISSED out of all frauds per day",title)
+    }
+
+    # Calculate n day moving average for missed frauds a day
+    # This is a possible metric to determine if retraining of model required
+
+    allResults$pcMissedD7<-NA
+    for (i in (METRIC_PERIOD+1):(nrow(allResults)+1)){
+      allResults$pcMissedD7[i-1]<-mean(allResults$pcMissedD[(i-METRIC_PERIOD):(i-1)])
+    }
+
+    fr<-max(allResults$pcMissedD7,na.rm = TRUE)
+    frmin<-min(allResults$pcMissedD7,na.rm = TRUE)
+    dt<-max(trainDataset$day)
+
+    # ************************************************
+    # Plots the n-day moving average of missed frauds chart
+    plot(allResults$day,
+         allResults$pcMissedD7,
+         type="l",
+         ylim=c(frmin-5, fr+5),
+         xlab="day",
+         ylab=paste(METRIC_PERIOD,"Day Moving Average Missed Frauds"),
+         main=paste("Concept Drift #",block,sep=""),
+         sub=title,
+         bty="n")
+
+    # Plot shaded area that shows the TRAIN DATASET
+    color <- rgb(t(col2rgb("grey")),alpha=80,maxColorValue = 255)
+    rect(0,0,dt,fr+5,col=color,border = NA)
+
+    # For the training dataset
+    # Verticle black dashed line to show TRAIN dataset
+    abline(v=dt,col="black",lty=2,lwd=3)
+    # Mean missed fraud metric
+    meanTrain<-round(mean(subset(allResults,day<=max(trainDataset$day))$pcMissedD7,na.rm=TRUE),digits=2)
+    text(x=dt/2,y=fr+5,paste("Train ",meanTrain),cex=0.8)
+
+    # Horizonal line Threshold to retrain
+    abline(h=DRIFT_THRESHOLD,col="blue",lty=2,lwd=3)
+    text(x=0,y=DRIFT_THRESHOLD+1,paste("Drift Threshold=",DRIFT_THRESHOLD,"%",sep=""),pos=4,cex=0.8)
+
+    # Day in the evaluation part of the dataset (i.e. not train) that indicates retrain required
+    retrainAt<-subset(allResults,(pcMissedD7>=DRIFT_THRESHOLD) & (day>max(trainDataset$day)))
+    if (nrow(retrainAt)>0){
+
+      # Day we need to retrain up to
+      dayToRetrain<-retrainAt$day[1]
+
+      # Plot on chart the average missed frauds before this retraining
+      meanEval<-round(mean(subset(allResults,(day>max(trainDataset$day)) & (day<=dayToRetrain))$pcMissedD7),digits=2)
+      text(max(trainDataset$day)+(dayToRetrain-max(trainDataset$day))/2,fr+5,meanEval,cex=0.8)
+
+      # Plot on chart the average missed frauds after this retraining
+      meanEval2<-round(mean(subset(allResults,(day>dayToRetrain))$pcMissedD7),digits=2)
+      text(dayToRetrain+(max(evalDataset$day)-dayToRetrain)/2,fr+5,meanEval2,cex=0.8)
+
+      # Verticle red dashed line to show where re-train is indicated
+      abline(v=dayToRetrain,col="red",lty=2,lwd=3)
+    } else {
+
+      # No retraining needed
+      dayToRetrain<-NA
+      meanEval<-round(mean(subset(allResults,(day>max(trainDataset$day)) )$pcMissedD7),2)
+      text( max(trainDataset$day)+(max(evalDataset$day)-max(trainDataset$day))/2,fr+5,meanEval,cex=0.8)
+    }
+
+    # Output results to a file
+    write.csv(allResults,file=resultsFile,row.names=TRUE)
+
+    # Output to the Viewer
+    #NprintMeasures(allResults)
+
+    print(paste("Concept Drift Analysis for",title))
+    print(paste("Concept drift threshold (FNR)=",DRIFT_THRESHOLD))
+    print(paste("Retraining indicated for day=",dayToRetrain))
+
+    return(list(
+      dayToRetrain=dayToRetrain,
+      metrics=allResults))
+
+  } #endof conveptDriftAnalysis
+
+  # ************************************************
+  # ************************************************
+
+  # create dataset has the first n days which in the train dataset
+  evalDataset<-rbind(trainDataset,verifyDataset)
+  combinedResults<-data.frame()
+  startDay<-0
+  block<-1
+
+  repeat {
+          r<-conceptDriftAnalysis(trainDataset,evalDataset)
+          r$metrics$block<-block
+          block<-block+1
+          if (is.na(r$dayToRetrain))
+            break  #exit the do loop if no more segments to re-train
+
+          # Create an updated training dataset which includes new data
+          trainDataset<-subset(evalDataset,day<=r$dayToRetrain)
+          combinedResults<-rbind(combinedResults,subset(r$metrics,(day>startDay) & (day<=r$dayToRetrain) ))
+          startDay<-r$dayToRetrain
+  } #endof repeat loop
+
+  combinedResults<-rbind(combinedResults,subset(r$metrics,(day>startDay) ))
+  combinedResults$block[1:DAYSTOTRAIN]<-0
+  fr<-max(combinedResults$pcMissedD7,na.rm = TRUE)
+  frmin<-min(combinedResults$pcMissedD7,na.rm = TRUE)
+
+  # Output results to a file,
+  write.csv(combinedResults,file=RESULTS_COMBINED,row.names=TRUE)
+  NprintMeasures(combinedResults)
+
+  # ************************************************
+  # Summary results chart after all re-training stages
+  plot(combinedResults$day,
+       combinedResults$pcMissedD7,
+       type="l",
+       ylim=c(frmin-5, fr+5),
+       xlab="day",
+       ylab=paste(METRIC_PERIOD,"Day Moving Average Missed Frauds"),
+       main="Concept Drift after all Retraining",
+       sub=title,
+       bty="n")
+
+  # Plot shaded area that shows the INITIAL TRAIN DATASET
+  color <- rgb(t(col2rgb("grey")),alpha=80,maxColorValue = 255)
+  rect(0,0,DAYSTOTRAIN,fr+5,col=color,border = NA)
+
+  # Horizonal line Threshold to retrain
+  abline(h=DRIFT_THRESHOLD,col="blue",lty=2,lwd=3)
+  text(x=0,y=DRIFT_THRESHOLD+1,paste("Drift Threshold=",DRIFT_THRESHOLD,"%",sep=""),pos=4,cex=0.8)
+
+  lastday<-0
+  for (line in 0:(block-1)){
+    rt<-which(combinedResults$block==line)
+    dayToRetrain<-combinedResults$day[rt[length(rt)]]
+    if (line<(block-1)){
+      abline(v=dayToRetrain,col="red",lty=2,lwd=3)
+    }
+    meanEval<-round(mean(subset(combinedResults,(day>lastday) & (day<=dayToRetrain))$pcMissedD7,na.rm = TRUE),digits=2)
+    text(lastday+(dayToRetrain-lastday)/2,fr+5,meanEval,cex=0.8)
+    lastday<-dayToRetrain
+  } #endof for()
+
+
+} #endof evalByDay()
+
+# ************************************************
+# evalOverTime :
+# EXPERIMENT 3 - EVALUATE FRAUD DETECTION OVER FUTURE DAYS
+# Train and evaluate a neural network on the first 30 days
+# The evalaute all transactions on each subsequent day and output results
+#
+# INPUT:
+#         Frame         - dataset       -  dataset of transaction
+#
+# OUTPUT :
+#         None
+# ************************************************
+evalOverTime<-function(dataset){
+
+  print("EXPERIMENT 3 - EVALUATE FRAUD DETECTION OVER FUTURE DAYS")
+
+  # ************************************************
+  # Create a dataset of the first n days of transactions
+  # This will be used to train/evalaute an initial model
+
+  daysOfTransactions<-max(dataset$day)
+
+  print(paste("Period of transactions=",daysOfTransactions,"days"))
+
+  # Creates train dataset for the first 30 days, removes fields we do not model
+  trainDataset<-trainDataset<-subset(dataset,day<=DAYSTOTRAIN,select=-state1)
+
+  # Creates test dataset for the remaining days, removes fields we do not model
+  # We leave 'day' in and will remove this before it is used in the NN
+  verifyDataset<-subset(dataset,day>DAYSTOTRAIN,select=-state1)
+
+  print(paste("Period train",DAYSTOTRAIN,"days. Has", nrow(trainDataset),"transactions"))
+  print(paste("Period verify",daysOfTransactions-DAYSTOTRAIN,"days. Has", nrow(verifyDataset),"transactions"))
+
+  # Calculate Ratio Genuine to Fraud (RGF) in train dataset
+  genuine_trans<-length(which(trainDataset[,OUTPUT_FIELD]==0))
+  fraud_trans<-nrow(trainDataset)-genuine_trans
+  rgf<-genuine_trans/fraud_trans
+  print(paste("Train Dataset: Fraud transactuions=",fraud_trans))
+  print(paste("Train Dataset: Genuine transactuions=",genuine_trans))
+  print(paste("Train Dataset: Ratio Genuine to Fraud (RGF)=",round(rgf,digits=2)))
+
+  # ************************************************
+  # Train model and then evaluate per day
+  evalByDay(trainDataset,verifyDataset,"Original Dataset",RESULTS_NEURALDAY)
+} #endof evalOverTime()
+
+
+# ************************************************
+# drift :
+# EXPERIMENT 4 - DRIFT: EVALUATE FRAUD DETECTION BY CHANGING 'AMOUNT'
+#
+# INPUT:
+#         Frame         - dataset       -  dataset of transaction
+#
+# OUTPUT :
+#         None
+# ************************************************
+drift<-function(dataset){
+
+  # For the passed value in FraudID (i.e. the cluster number):
+  # 1. Train the NN on first 30 days of transactions
+  # 2. Then for all the remaining days, change the values in the field 'amount' for the frauds by a range 10%-100%
+  # 3. Evaluate the NN using these transactions with the changed values
+  # 4. Output the results as CSV file, Viewer and a chart
+driftForACluster<-function(fraudID){
+
+  print(paste("Drift values in 'amount' for Cluster with ID", fraudID))
+
+  # This is a data frame that contains the verify dataset where we change the field values
+  datasetToEvaluate<-verifyDataset
+  recordsInVerify<-nrow(verifyDataset)
+
+  # Change the 'amount' by a % for all frauds in the specified cluster ID
+  # this is original amount x 10%, 20%, 30%... 100%
+  for (i in 1:10) {
+
+    # The the value in 'amounts' for just the fraud records with the cluster ID
+    amounts<-verifyDataset$amount[which(verifyDataset$cluster==fraudID)]
+
+    # Increase the amount by i*10%
+    increase<-amounts+(amounts*i*0.1)
+
+    # Maximum value is scaled as 1
+    increase<-ifelse(increase<1,increase,1)
+
+    # This changes the amount field
+    verifyDataset$amount[which(verifyDataset$cluster==fraudID)]<-increase
+
+    # First block is the original verify dataset
+    # subsequentblock has the changed values
+    datasetToEvaluate<-rbind(datasetToEvaluate,verifyDataset)
+  } #endof for()
+
+  # ************************
+  # TRAIN the neural network on the first 30 days
+  # Then evaluate using the above data (remove the cluster ID and day as input fields)
+  predicted_class<-runExperiment(trainDataset,
+                                 subset(datasetToEvaluate,select=c(-cluster,-day)))
+
+  # This creates a new field called 'neuralPredict' which has the predicted class for every record
+  datasetToEvaluate$neuralPreidict<-predicted_class
+
+  # The first entry (1) is the evaluation with the ORIGINAL value in amount
+  # The other entries (2-11) are for original amount x 10%, 20%, 30%... 100%
+  allResults<-data.frame()
+  for(i in 1:11){
+    blockstart<-1+((i-1)*recordsInVerify)
+    blockend<-(blockstart+recordsInVerify)-1
+    oneblock<-datasetToEvaluate[blockstart:blockend,]
+    results<-data.frame(NcalcConfusion(oneblock[,OUTPUT_FIELD],oneblock$neuralPreidict))
+
+    # Calculate daily measures
+    daysInTestDataset<-length(unique(oneblock$day))
+    results$meanAlertsD<-(results$TP+results$FP)/daysInTestDataset  # Number of alerts that are generated each day
+    results$FraudD<-results$TP/daysInTestDataset  # Number of frauds CORRECT per day
+    results$MissedD<-results$FN/daysInTestDataset # Number of frauds MISSED per day
+
+    allResults<-rbind(allResults,results)
+  } #endof for()
+
+  allResults$drift<-seq(0,100,10)  # label for % change
+  allResults$cluster<-fraudID      # label for the cluster we are analysing
+
+  # Output results to a file, the filename has the clsuterID appended
+  write.csv(allResults,file=paste(RESULTS_DRIFT,"_",fraudID,".csv",sep = ""),row.names=TRUE)
+
+  # Output results to the Viewer
+  NprintMeasures(allResults)
+
+  # Chart to show performance of model changing (falling) the more that the fraud vector in the cluster drifts
+  spatialEco::trend.line(allResults$drift,allResults$MCC,type='linear',
+                         plot=TRUE,
+                         pch=20,
+                         main=paste("Drift changing the amount field. For cluster=",fraudID),
+                         ylab="MCC",
+                         xlab="% Change of value")
+  }  #endof driftForACluster()
+
+  # ******************************
+  # Runs the experiment for every fraud cluster and outputs the results
+  # some clusters may be mroe sensitive to the change of 'amount' than others?
+  driftAmountAllClusters<-function(){
+
+    print("(A) CHANGE VALUE IN 'AMOUNT' FOR EACH FRAUD CLUSTER & EVALUATE")
+
+    for (fraudID in 1:max(modelKmeans$cluster)){
+        driftForACluster(fraudID)
+    }
+  } #endof driftAmountAllClusters()
+
+  # ******************************
+  simulateNewFraud<-function(){
+    # This is the number of fraud records for each cluster in entire dataset
+    numberOfFrauds<-table(modelKmeans$cluster)
+
+    # Find the fraud cluster ID that has the most number of frauds
+    fraudID<-which(numberOfFrauds==max(numberOfFrauds))
+
+    # Calculate the conditional probability for these fields to be set as 1 and fraud to be indicated
+    # These fields were shown most important in NN
+    # flag5_2, flag4, indicator2
+
+    changeValue<-function(field){
+      totalFrauds<-length(which(verifyDataset$fraud==1))  # Number of frauds in verify dataset
+      conP<-(length(which((field==1) & (verifyDataset$fraud==1))))/totalFrauds
+      v<-ifelse(conP<=0.5,1,0)
+      return(v)
+    }
+
+    # We will create a new fraud vector by changing these flags to the OPPOSITE of what the
+    # NN has seen before - so we are simulating a completely different fraud vector
+    # Change field values in a single fraud cluster
+    # These are the top 3 "important" fields.
+    # For the experiment, change the fraud at a future day
+
+    clusterIndex<-which(verifyDataset$cluster==fraudID)
+
+    verifyDataset$flag5_2[clusterIndex]<-changeValue(verifyDataset$flag5_2)
+    verifyDataset$flag4[clusterIndex]<-changeValue(verifyDataset$flag5_2)
+    verifyDataset$indicator2[clusterIndex]<-changeValue(verifyDataset$indicator2)
+    verifyDataset$flag5_4[clusterIndex]<-changeValue(verifyDataset$flag5_4)
+
+    return(list(
+      trainDataset=trainDataset,
+      verifyDataset=verifyDataset
+    ))
+  } #endof simulateNewFraud()
+
+  # ******************************
+
+  print("EXPERIMENT 4 - CONCEPT DRIFT")
+
+  # CLUSTER THE ENTIRE DATASET
+  # Selects just the fraud records
+  fraudsInTrain<-subset(dataset,fraud==1)
+
+  # Just the input fields to cluster
+  # Remove fields that we do not wish to model
+  predictors<-fraudsInTrain[ , !(names(fraudsInTrain) %in% c("day",
+                                                             "fraud",
+                                                             "state1"))]
+
+  modelKmeans <- kmeans(predictors, centers=FORCED_CLUSTER,nstart=START_CLUSTER)
+  pp<-predictors[,apply(predictors, 2, var, na.rm=TRUE) != 0]
+
+  # Output a 2d cluster chart using PCA to show just the first two dimensions of the clusters
+  chartTitle<-paste("Fraud Clusters=",FORCED_CLUSTER,"On ENTIRE dataset")
+  p<-factoextra::fviz_cluster(modelKmeans, data = pp,geom = "point",main = chartTitle)
+  print(p)
+
+  # Add a new field to the entire dataset called 'cluster'
+  dataset$cluster<-NA  # Set all the entries to NA.  Genuine records will all have NA
+  dataset[which(dataset$fraud==1),]$cluster<-modelKmeans$cluster #Set cluster ID fir all the fraud records
+
+  daysOfTransactions<-max(dataset$day)
+
+  # Create a dataset to use to train on the first [30] days, remove cluster ID, day and state1 as inputs
+  trainDataset<-subset(dataset,day<=DAYSTOTRAIN, select=c(-state1,-cluster))
+
+  # Create a dataset to use on remaining days to evaluate the results, remove state1 as inputs
+  # Leave in the day field as will use this for analysis
+  verifyDataset<-subset(dataset,day>DAYSTOTRAIN,select=-state1)
+
+  # ******************************
+  # Experiment (a) Change 'amount' in each cluster
+  # UNCOMMENT TO RUN THIS EXPERIMENT
+  # driftAmountAllClusters()
+
+  # ******************************
+  # Experiment (b) Detect drift and retrain if needed
+
+  # Use original dataset. Train on first 30 days, evaluate and detect drift
+  # When drift detected, re-train the NN and repeat
+  evalByDay(trainDataset,
+            subset(verifyDataset,select=-cluster),
+            "Original Dataset",
+            RESULTS_NEURALDAY)
+
+  # ******************************
+  # Simulate a new fraud type by changing top 4 important fields, in biggest cluster
+
+  r<-simulateNewFraud()  # Creates updated dataset with the new fraud
+
+  evalByDay(r$trainDataset,
+            subset(r$verifyDataset,select=-cluster),
+            "Simulated New Fraud Type",
+            RESULTS_NEURALDAYT)
+
+} #endof drift()
+
+
+# ************************************************
+# main() : main entry point
+# INPUT:   None
+# OUTPUT : None
+# ************************************************
+main<-function(){
+
+  # ************************************************
+  # INITIALISE NEURAL NETWORK DEEP LEARNING USING H2O library
+
+  N_DEEP_Initialise(TRUE)
+
+  # ************************************************
+  # Read preprocessed dataset. Split into train and verify by days
+  # Output dataset info on the console
+  # "fraud" is encoded as: 1 = Fraud, 0 = Genuine
+
+  dataset<-read.csv(file=DATASET_PREPROCESSED,encoding="UTF-8",header=TRUE, stringsAsFactors = FALSE)
+
+  print(paste("CSV dataset",DATASET_PREPROCESSED,
+              "has been read. Records=",nrow(dataset),
+              "Fields=",ncol(dataset)))
+
+  plotTransactionVolume(dataset,"(Full FICO Dataset)")
+
+  # Output the daily transaction volumes to a CSV file
+  volfraud<-table(subset(dataset,fraud==1)$day)
+  volgenuine<-table(subset(dataset,fraud==0)$day)
+  write.csv(data.frame(volfraud,volgenuine),file=DATASET_TXVOLUME, row.names=FALSE)
+  print(paste("Write CSV dataset",DATASET_TXVOLUME,"Records=",nrow(dataset),"Fields=",ncol(dataset)))
+
+  # ************************************************
+  # These are the experiments
+  # UNCOMMENT TO RUN EACH EXPERIMENT
+
+  # EXPERIMENT 1 - BUILD AND EVALUATE A FRAUD CLASSIFIER USING A NEURAL NETWORK
+  # fraudClassifier(dataset)
+
+  # EXPERIMENT 2 - DETERMINE THE FIELD IMPORTANCE IN THE NEURAL NETWORK
+  # fieldImportance(dataset)
+
+  # EXPERIMENT 3 - EVALUATE FRAUD DETECTION OVER FUTURE DAYS - IT SHOULD GET WORSE
+  # evalOverTime(dataset)
+
+  # EXPERIMENT 4 - DRIFT.
+  # 4a - Change the value in 'amount' by increments of 10%, in each fraud cluster
+  # 4b - Change the values of the most important fields to simulate a new fraud type
+   drift(dataset)
+
+} #endof main()
+
+# ************************************************
+# R starts execution
+
+# Clears all warning messages
+assign("last.warning", NULL, envir = baseenv())
+
+# clears the console area
+cat("\014")
+
+# ************************************************
+print("START MODEL")
+
+# Define and then load the libraries used in this project
+ myLibraries<-c(
+  "h2o",
+  "pROC",
+  "formattable",
+  "spatialEco"
+  )
+
+library(pacman)
+pacman::p_load(char=myLibraries,install=TRUE,character.only=TRUE)
+
+# ************************************************
+#Load additional R script files provide for this lab
+source("4labFunctions.R")
+source("6dataPrepFunctions.R")
+
+# ************************************************
+set.seed(123)
+
+main()
+
+print("END")
